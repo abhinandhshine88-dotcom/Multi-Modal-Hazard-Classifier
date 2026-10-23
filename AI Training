@@ -1,0 +1,16 @@
+!pip install ultralytics
+!pip install roboflow
+
+from roboflow import Roboflow
+rf = Roboflow(api_key="**************")
+project = rf.workspace("test-pzbxl").project("fire-smoke-yolov8")
+version = project.version(1)
+dataset = version.download("yolov8")
+from ultralytics import YOLO
+
+# Load the base nano model weights
+model = YOLO('yolov8n.pt')
+
+# Train the model using the downloaded dataset's data.yaml configuration file
+
+results = model.train(data=f"{dataset.location}/data.yaml", epochs=50, imgsz=640, device=0)
