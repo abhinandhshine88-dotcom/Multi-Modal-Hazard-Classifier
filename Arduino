@@ -1,173 +1,73 @@
-import cv2
-import serial
-import time
-import numpy as np
-from ultralytics import YOLO
+// --- Pin Configurations ---
+const int MQ135_PIN = A0;    // MQ-135 Analog Output
+const int MQ2_PIN = A1;      // MQ-2 Analog Output
+const int BUZZER_PIN = 8;    // Raw Piezo Disc (Positive Center)
+const int YELLOW_LED = 11;   // Warning Indicator
+const int RED_LED = 12;      // Critical Alarm Indicator
 
-def initialize_serial(port='COM9', baudrate=9600):
-    """Connects to the physical Arduino or falls back to simulation mode."""
-    try:
-        arduino = serial.Serial(port=port, baudrate=baudrate, timeout=1)
-        time.sleep(2)  # Bootloader stabilization guard
-        print(f"[INFO] Hardware connection active on {port}.")
-        return arduino, False
-    except serial.SerialException:
-        print(f"\n[WARNING] Arduino hardware not detected on {port}.")
-        print("[STATUS] Running in SIMULATION MODE.\n")
-        return None, True
+// --- Threshold Settings (Adjust based on calibration) ---
+const int MQ135_THRESHOLD = 400; 
+const int MQ2_THRESHOLD = 350;   
 
-def run_gas_neural_net_inference(mq135_raw, mq2_raw):
-    # 0. Deadzone Filter (Noise Floor Bypass)
-    # If readings are near your baseline (~388 for MQ135, ~80 for MQ2), bypass the network.
-    if mq135_raw < 450.0 and mq2_raw < 150.0:
-        return "Normal / Clean Air", -1, 100.0
+void setup() {
+  // Start serial communication at 9600 baud for Python integration
+  Serial.begin(9600); 
+  
+  // Initialize digital output pins
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+}
 
-    # 1. Feature Scaling (Adjusted to your room's actual baseline)
-    mq135_scaled = (mq135_raw - 400.0) / 200.0
-    mq2_scaled   = (mq2_raw - 100.0) / 200.0
-    inputs = np.array([mq135_scaled, mq2_scaled])
+void loop() {
+  // 1. Read raw analog values from the sensors (0 to 1023)
+  int mq135_val = analogRead(MQ135_PIN); 
+  int mq2_val = analogRead(MQ2_PIN);   
+  
+  // Flag to track if the hardware is already in a critical state
+  bool hardware_danger = false;
 
-    # 2. Hidden Layer 1 (Dense 16 + ReLU)
-    w1 = np.zeros((2, 16))
-    w1[0, :8] = 1.2   # Neurons 0-7 react strongly to high MQ-135 (VOCs / Electrical)
-    w1[1, 8:] = 1.2   # Neurons 8-15 react strongly to high MQ-2 (Combustible / Hydrocarbons)
-    b1 = np.zeros(16)
-    layer1_out = np.maximum(0, np.dot(inputs, w1) + b1)
+  // 2. Simple threshold alert logic (Hardware Failsafe)
+  if (mq2_val > MQ2_THRESHOLD) {
+    // Critical Hazard: Flash Red LED and sound a 2.5kHz tone
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(YELLOW_LED, LOW);
+    tone(BUZZER_PIN, 2500); 
+    hardware_danger = true;
+  } 
+  else if (mq135_val > MQ135_THRESHOLD) {
+    // Moderate Hazard: Turn on Yellow LED, turn off buzzer
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(YELLOW_LED, HIGH);
+    noTone(BUZZER_PIN);
+  } 
+  else {
+    // All Clear: Everything off
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(YELLOW_LED, LOW);
+    noTone(BUZZER_PIN);
+  }
 
-    # 3. Hidden Layer 2 (Dense 8 + ReLU)
-    w2 = np.zeros((16, 8))
-    w2[:8, :4] = 1.0  # Pass MQ-135 signals to neurons 0-3
-    w2[8:, 4:] = 1.0  # Pass MQ-2 signals to neurons 4-7
-    b2 = np.zeros(8)
-    layer2_out = np.maximum(0, np.dot(layer1_out, w2) + b2)
+  // 3. Listen for Python AI Overrides (Decision-Level Fusion)
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    
+    // Python sends '2' if YOLO detects fire OR MLP detects critical gas
+    if (cmd == '2') {
+      digitalWrite(RED_LED, HIGH);
+      tone(BUZZER_PIN, 2200); // Slightly different tone for AI trigger
+    } 
+    // Python sends '1' if YOLO detects a human (Tracking mode)
+    else if (cmd == '1' && !hardware_danger) {
+      digitalWrite(YELLOW_LED, HIGH); 
+    }
+  }
 
-    # 4. Output Layer (Dense 3)
-    w3 = np.zeros((8, 3))
-    w3[:4, 0] = 1.5   # Neurons 0-3 strongly excite Class 0 (Electrical/Plastic)
-    w3[4:, 1] = 1.5   # Neurons 4-7 strongly excite Class 1 (Combustible Gas)
-    w3[:4, 2] = 0.9   # Both excite Class 2 (Biomass/Smoke)
-    w3[4:, 2] = 0.9
-    b3 = np.array([0.0, 0.0, 0.0])
+  // 4. Stream data to the Python pipeline: "MQ135,MQ2"
+  Serial.print(mq135_val);
+  Serial.print(",");
+  Serial.println(mq2_val);
 
-    logits = np.dot(layer2_out, w3) + b3
-
-    # 5. Softmax Normalization
-    exp_logits = np.exp(logits - np.max(logits))
-    probabilities = exp_logits / np.sum(exp_logits)
-    predicted_class_idx = int(np.argmax(probabilities))
-
-    class_labels = {
-        0: "Electrical / Plastic Fire",
-        1: "Combustible Gas / Chemical Leak",
-        2: "Biomass Fire (Wood/Smoke)"
-    }
-
-    predicted_label = class_labels[predicted_class_idx]
-    confidence = probabilities[predicted_class_idx] * 100.0
-
-    return predicted_label, predicted_class_idx, confidence
-
-
-def main():
-    try:
-        vision_model = YOLO('best.pt')
-        base_model = YOLO('yolov8n.pt')
-        print("[INFO] Computer Vision models loaded.")
-    except Exception as e:
-        print(f"[ERROR] YOLO model load failed: {e}")
-        return
-
-    arduino, is_simulated = initialize_serial(port='COM9', baudrate=9600)
-    cap = cv2.VideoCapture(0)
-    current_mq135, current_mq2 = 150.0, 120.0
-
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
-
-        visual_hazard = "Clear"
-        human_present = False
-
-        # Vision Pipeline
-        hazard_results = vision_model(frame, verbose=False)
-        for box in hazard_results[0].boxes:
-            if float(box.conf[0]) > 0.60:
-                cls_id = int(box.cls[0])
-                visual_hazard = vision_model.names[cls_id].lower()
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                # [FIX ADDED] Draw bounding box labels for hazards
-                cv2.putText(frame, visual_hazard.upper(), (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        human_results = base_model(frame, classes=[0], verbose=False)
-        for box in human_results[0].boxes:
-            if float(box.conf[0]) > 0.50:
-                human_present = True
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                # [FIX ADDED] Draw bounding box labels for humans
-                cv2.putText(frame, "Human", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        # Serial Ingestion
-        # [FIX ADDED] Flush the buffer by reading all available lines, keeping only the freshest data
-        if not is_simulated and arduino.in_waiting > 0:
-            try:
-                raw_line = ""
-                while arduino.in_waiting > 0:
-                    raw_line = arduino.readline().decode('utf-8').strip()
-                
-                if "," in raw_line:
-                    parts = raw_line.split(",")
-                    current_mq135 = float(parts[0])
-                    current_mq2 = float(parts[1])
-            except Exception:
-                pass
-
-        # Interactive Simulation Keys (when hardware is disconnected)
-        key = cv2.waitKey(1) & 0xFF
-        if is_simulated:
-            if key == ord('1'):
-                current_mq135, current_mq2 = 790.0, 240.0
-            elif key == ord('2'):
-                current_mq135, current_mq2 = 210.0, 810.0
-            elif key == ord('3'):
-                current_mq135, current_mq2 = 880.0, 840.0
-            elif key == ord('r'):
-                current_mq135, current_mq2 = 150.0, 120.0
-
-        # Run MLP Classification
-        gas_status, gas_class_id, gas_conf = run_gas_neural_net_inference(current_mq135, current_mq2)
-
-        # Send Actuation to Arduino
-        if not is_simulated:
-            if visual_hazard != "Clear" or current_mq135 > 500 or current_mq2 > 500:
-                arduino.write(b'2')
-            elif human_present:
-                arduino.write(b'1')
-            else:
-                # [FIX ADDED] Send safe state command to turn off alarms
-                arduino.write(b'0')
-
-        # Dashboard Overlay
-        cv2.rectangle(frame, (15, 15), (510, 135), (0, 0, 0), -1)
-        cv2.putText(frame, f"MQ-135 Air Quality Raw: {current_mq135:.1f}", (25, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, f"MQ-2 Combustible Raw  : {current_mq2:.1f}", (25, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        hud_color = (0, 0, 255) if (current_mq135 > 400 or current_mq2 > 400) else (0, 255, 0)
-        
-        # [FIX ADDED] Removed the extra *100 from gas_conf calculation
-        cv2.putText(frame, f"E-Nose Deep Net State : {gas_status} ({gas_conf:.1f}%)", (25, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1)
-        cv2.putText(frame, f"Camera Target Stream  : {visual_hazard.upper()}", (25, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-        cv2.imshow("Multi-Modal Edge Hazard Fusion Dashboard", frame)
-        if key == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    if not is_simulated:
-        arduino.close()
-
-if __name__ == "__main__":
-    main()
+  // 5. Small delay to stabilize readings and keep the Python UI responsive
+  delay(200); 
+}
