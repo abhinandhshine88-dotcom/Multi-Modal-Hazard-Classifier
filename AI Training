@@ -8,7 +8,7 @@ version = project.version(1)
 dataset = version.download("yolov8")
 from ultralytics import YOLO
 
-# Load the base nano model weights
+# LOAD THE BASE NANO WEIGHTS
 model = YOLO('yolov8n.pt')
 
 # Train the model using the downloaded dataset's data.yaml configuration file
