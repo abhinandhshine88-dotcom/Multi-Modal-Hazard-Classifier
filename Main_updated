@@ -1,0 +1,426 @@
+import argparse
+import time
+
+import cv2
+import numpy as np
+import serial
+from serial.tools import list_ports
+from ultralytics import YOLO
+
+# ----------------------------------------------------------------------------
+# Configuration (all tunables in one place)
+# ----------------------------------------------------------------------------
+DEFAULT_PORT = "COM9"
+BAUDRATE = 9600
+
+FIRE_CONF = 0.60          # best.pt  (fire / smoke)
+HUMAN_CONF = 0.50         # yolov8n.pt (COCO class 0 = person)
+
+# --- Gas: Z-score settings ---------------------------------------------------
+# z = (raw - baseline_mean) / scale,  scale = max(measured_std, REL_STD_FLOOR*mean, ABS_STD_FLOOR)
+# With REL_STD_FLOOR = 0.05, "z = 1" means "5% above this sensor's clean-air level",
+# which makes both sensors comparable regardless of their raw range.
+REL_STD_FLOOR = 0.05
+ABS_STD_FLOOR = 2.0
+Z_DETECT = 2.0            # >= 10% above baseline  -> MLP classifies the gas
+Z_CRITICAL = 5.0          # >= 25% above baseline  -> override byte b'2'
+INPUT_SCALE = 6.0         # keeps MLP logits small so softmax confidence is graded
+
+DEFAULT_BASELINE = (547.0, 138.0)   # typical clean-air readings of this setup (MQ-135, MQ-2)
+DRIFT_ALPHA = 0.002       # slow baseline tracking of thermal/humidity drift (0 disables)
+CALIB_SECONDS = 10.0
+MIN_CAL_SAMPLES = 5
+
+ALARM_HOLD_S = 3.0        # keep b'2' this long after the last trigger (no flicker)
+SENSOR_STALE_S = 3.0      # warn on HUD if no valid sample this long
+
+# Simulation scenarios, as raw offsets from the baseline (MQ-135, MQ-2)
+SIM_SCENARIOS = {
+    ord("1"): (+250.0, +8.0),    # electrical / plastic: MQ-135 dominant
+    ord("2"): (+8.0, +90.0),     # combustible gas:      MQ-2 dominant
+    ord("3"): (+250.0, +80.0),   # biomass / smoke:      both rise
+}
+
+CLASS_LABELS = {
+    0: "Electrical / Plastic Fire",
+    1: "Combustible Gas / Chemical Leak",
+    2: "Biomass Fire (Wood/Smoke)",
+}
+
+
+# ----------------------------------------------------------------------------
+# Baseline (Z-score) handling
+# ----------------------------------------------------------------------------
+class Baseline:
+    """Per-sensor clean-air baseline used for Z-score normalisation."""
+
+    def __init__(self, mean135, mean2, std135=0.0, std2=0.0):
+        self.mean = np.array([mean135, mean2], dtype=float)
+        self.std = np.array([std135, std2], dtype=float)
+
+    @property
+    def scale(self):
+        return np.maximum.reduce([self.std,
+                                  REL_STD_FLOOR * self.mean,
+                                  np.full(2, ABS_STD_FLOOR)])
+
+    def z(self, mq135, mq2):
+        z = (np.array([mq135, mq2], dtype=float) - self.mean) / self.scale
+        return float(z[0]), float(z[1])
+
+    def track_drift(self, mq135, mq2):
+        """Nudge the mean toward clean-air readings (compensates slow drift)."""
+        if DRIFT_ALPHA > 0:
+            self.mean += DRIFT_ALPHA * (np.array([mq135, mq2], dtype=float) - self.mean)
+
+    def describe(self):
+        return (f"MQ-135 mean={self.mean[0]:.1f} scale={self.scale[0]:.1f} | "
+                f"MQ-2 mean={self.mean[1]:.1f} scale={self.scale[1]:.1f}")
+
+
+class Calibrator:
+    """Collects clean-air samples for a few seconds and builds a Baseline."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.start = time.time()
+        self.samples = []
+
+    def add(self, sample):
+        self.samples.append(sample)
+
+    def remaining(self):
+        return max(0.0, self.seconds - (time.time() - self.start))
+
+    def done(self):
+        elapsed = time.time() - self.start
+        if elapsed >= self.seconds and len(self.samples) >= MIN_CAL_SAMPLES:
+            return True
+        return elapsed >= 3 * self.seconds      # give up waiting for sensor data
+
+    def result(self):
+        if len(self.samples) < MIN_CAL_SAMPLES:
+            print("[WARNING] Too few sensor samples during calibration; "
+                  "using default baseline.")
+            return Baseline(*DEFAULT_BASELINE)
+        a = np.array(self.samples, dtype=float)
+        mean = np.median(a, axis=0)                          # robust to blips
+        std = 1.4826 * np.median(np.abs(a - mean), axis=0)   # robust std (MAD)
+        return Baseline(mean[0], mean[1], std[0], std[1])
+
+
+# ----------------------------------------------------------------------------
+# Chemical MLP  (2 -> 16 -> 8 -> 3), hand-calibrated, built once at import time
+# ----------------------------------------------------------------------------
+def _build_network():
+    w1 = np.zeros((2, 16))
+    w1[0, :8] = 1.2   # neurons 0-7  : MQ-135 (VOC / electrical / plastic)
+    w1[1, 8:] = 1.2   # neurons 8-15 : MQ-2   (combustible / hydrocarbons)
+    b1 = np.zeros(16)
+
+    # 1/8 = average over each group of 8 inputs (keeps logits small -> graded softmax)
+    w2 = np.zeros((16, 8))
+    w2[:8, :4] = 1.0 / 8.0
+    w2[8:, 4:] = 1.0 / 8.0
+    b2 = np.zeros(8)
+
+    w3 = np.zeros((8, 3))
+    w3[:4, 0] = 1.5   # MQ-135 group -> Class 0 (Electrical/Plastic)
+    w3[4:, 1] = 1.5   # MQ-2 group   -> Class 1 (Combustible gas)
+    w3[:4, 2] = 0.9   # both groups  -> Class 2 (Biomass/Smoke)
+    w3[4:, 2] = 0.9
+    b3 = np.zeros(3)
+    return w1, b1, w2, b2, w3, b3
+
+
+W1, B1, W2, B2, W3, B3 = _build_network()
+
+
+def run_gas_neural_net_inference(z135, z2):
+    """Input: Z-scores of MQ-135 and MQ-2 (clean air = 0).
+    Returns (label, class_idx, confidence_percent); class_idx = -1 means clean air."""
+    if z135 < Z_DETECT and z2 < Z_DETECT:
+        return "Normal / Clean Air", -1, 100.0
+
+    inputs = np.array([z135, z2]) / INPUT_SCALE
+    h1 = np.maximum(0.0, inputs @ W1 + B1)   # Dense 16 + ReLU (drops negative z)
+    h2 = np.maximum(0.0, h1 @ W2 + B2)       # Dense 8  + ReLU
+    logits = h2 @ W3 + B3                    # Dense 3
+
+    if np.all(logits <= 1e-9):
+        return "Normal / Clean Air", -1, 100.0
+
+    exp_logits = np.exp(logits - np.max(logits))          # stable softmax
+    probabilities = exp_logits / np.sum(exp_logits)
+    idx = int(np.argmax(probabilities))
+    return CLASS_LABELS[idx], idx, float(probabilities[idx] * 100.0)
+
+
+# ----------------------------------------------------------------------------
+# Serial helpers
+# ----------------------------------------------------------------------------
+def find_arduino_port():
+    """Best-effort auto-detect of an Arduino-like USB serial port."""
+    for p in list_ports.comports():
+        text = f"{p.description} {p.manufacturer}".lower()
+        if any(tag in text for tag in ("arduino", "ch340", "usb serial", "usb-serial")):
+            return p.device
+    return None
+
+
+def initialize_serial(port=DEFAULT_PORT, baudrate=BAUDRATE):
+    """Connect to the Arduino, trying the given port then auto-detect.
+    Returns (serial_or_None, is_simulated)."""
+    candidates = [port]
+    detected = find_arduino_port()
+    if detected and detected not in candidates:
+        candidates.append(detected)
+
+    for p in candidates:
+        try:
+            arduino = serial.Serial(port=p, baudrate=baudrate, timeout=0.1)
+            time.sleep(2)                 # Uno auto-resets when the port opens
+            arduino.reset_input_buffer()  # drop boot-time garbage
+            print(f"[INFO] Hardware connection active on {p}.")
+            return arduino, False
+        except (serial.SerialException, OSError):
+            continue
+
+    print(f"\n[WARNING] Arduino hardware not detected (tried: {', '.join(candidates)}).")
+    print("[STATUS] Running in SIMULATION MODE (keys 1/2/3 inject gas, r resets).\n")
+    return None, True
+
+
+def read_latest_sample(arduino):
+    """Drain the UART buffer and return the newest valid (mq135, mq2), or None."""
+    latest = None
+    while arduino.in_waiting > 0:
+        line = arduino.readline().decode("utf-8", errors="ignore").strip()
+        parts = line.split(",")
+        if len(parts) == 2:
+            try:
+                latest = (float(parts[0]), float(parts[1]))
+            except ValueError:
+                pass          # boot message / partial line - keep previous good value
+    return latest
+
+
+def decide_command(critical, human_present):
+    """Decision-level fusion -> single override byte."""
+    if critical:
+        return b"2"
+    if human_present:
+        return b"1"
+    return b"0"
+
+
+# ----------------------------------------------------------------------------
+# Vision helpers
+# ----------------------------------------------------------------------------
+def detect_hazards(model, frame):
+    """Return list of (name, conf, (x1, y1, x2, y2)) above FIRE_CONF."""
+    found = []
+    for box in model(frame, verbose=False)[0].boxes:
+        conf = float(box.conf[0])
+        if conf > FIRE_CONF:
+            name = model.names[int(box.cls[0])].lower()
+            found.append((name, conf, tuple(map(int, box.xyxy[0]))))
+    return found
+
+
+def detect_humans(model, frame):
+    """Return list of (x1, y1, x2, y2) for persons above HUMAN_CONF."""
+    found = []
+    for box in model(frame, classes=[0], verbose=False)[0].boxes:
+        if float(box.conf[0]) > HUMAN_CONF:
+            found.append(tuple(map(int, box.xyxy[0])))
+    return found
+
+
+def draw_hud(frame, mq135, mq2, z135, z2, baseline, gas_status, gas_class_id,
+             gas_conf, visual_hazard, command, simulated, stale, calibrating):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    white = (255, 255, 255)
+    cv2.rectangle(frame, (15, 15), (600, 215), (0, 0, 0), -1)
+    cv2.putText(frame, f"MQ-135 Air Quality Raw: {mq135:.1f}   z={z135:+.1f}", (25, 40), font, 0.5, white, 1)
+    cv2.putText(frame, f"MQ-2 Combustible Raw  : {mq2:.1f}   z={z2:+.1f}", (25, 65), font, 0.5, white, 1)
+
+    if calibrating:
+        hud_color = (0, 165, 255)
+    else:
+        hud_color = (0, 0, 255) if gas_class_id != -1 else (0, 255, 0)
+    conf_txt = "" if calibrating else f" ({gas_conf:.1f}%)"
+    cv2.putText(frame, f"E-Nose Deep Net State : {gas_status}{conf_txt}", (25, 90), font, 0.5, hud_color, 1)
+    cv2.putText(frame, f"Camera Target Stream  : {(visual_hazard or 'CLEAR').upper()}",
+                (25, 115), font, 0.5, (255, 255, 0), 1)
+
+    cmd_text = {b"2": "2 CRITICAL", b"1": "1 HUMAN", b"0": "0 NOMINAL"}[command]
+    cmd_color = {b"2": (0, 0, 255), b"1": (0, 255, 255), b"0": (0, 255, 0)}[command]
+    cv2.putText(frame, f"Fusion Command        : {cmd_text}", (25, 140), font, 0.5, cmd_color, 1)
+
+    cv2.putText(frame, f"Baseline (clean air)  : {baseline.mean[0]:.0f} / {baseline.mean[1]:.0f}",
+                (25, 165), font, 0.5, white, 1)
+
+    mode = "SIMULATION (keys 1/2/3, r)" if simulated else "HARDWARE (c = recalibrate)"
+    if stale:
+        mode += " - SENSOR DATA STALE"
+    cv2.putText(frame, f"Mode                  : {mode}", (25, 190), font, 0.5,
+                (0, 165, 255) if (simulated or stale) else white, 1)
+
+
+# ----------------------------------------------------------------------------
+# Main loop
+# ----------------------------------------------------------------------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Multi-Modal Edge Hazard Detection")
+    ap.add_argument("--port", default=DEFAULT_PORT, help="Arduino serial port (default COM9)")
+    ap.add_argument("--camera", type=int, default=0, help="Webcam index (default 0)")
+    ap.add_argument("--calib-seconds", type=float, default=CALIB_SECONDS,
+                    help="Clean-air calibration time at start-up (default 10)")
+    ap.add_argument("--fire-model", default="best.pt")
+    ap.add_argument("--base-model", default="yolov8n.pt")
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    try:
+        vision_model = YOLO(args.fire_model)
+        base_model = YOLO(args.base_model)
+        print("[INFO] Computer Vision models loaded.")
+    except Exception as e:
+        print(f"[ERROR] YOLO model load failed: {e}")
+        return
+
+    arduino, simulated = initialize_serial(args.port, BAUDRATE)
+
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open camera index {args.camera}.")
+        if arduino:
+            arduino.close()
+        return
+
+    baseline = Baseline(*DEFAULT_BASELINE)
+    calibrator = None
+    if not simulated:
+        calibrator = Calibrator(args.calib_seconds)
+        print(f"[CALIBRATION] Measuring clean-air baseline for {args.calib_seconds:.0f} s "
+              "- keep both sensors in clean air (let them warm up first).")
+    mq135, mq2 = (float(v) for v in baseline.mean)
+    last_sample_t = time.time()
+    alarm_until = 0.0
+
+    def drop_to_simulation(reason):
+        """Arduino vanished mid-run: keep the HUD + networks alive in simulation mode."""
+        nonlocal arduino, simulated, mq135, mq2, calibrator
+        print(f"\n[WARNING] Serial link lost ({reason}). Switching to SIMULATION MODE.\n")
+        try:
+            arduino.close()
+        except Exception:
+            pass
+        arduino, simulated, calibrator = None, True, None
+        mq135, mq2 = (float(v) for v in baseline.mean)
+
+    try:
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                print("[WARNING] Camera frame grab failed; stopping.")
+                break
+
+            # --- Vision: run both models on the CLEAN frame, draw afterwards ---
+            hazards = detect_hazards(vision_model, frame)
+            humans = detect_humans(base_model, frame)
+            visual_hazard = max(hazards, key=lambda h: h[1])[0] if hazards else None
+            human_present = bool(humans)
+
+            for name, _conf, (x1, y1, x2, y2) in hazards:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(frame, name.upper(), (x1, max(15, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            for (x1, y1, x2, y2) in humans:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, "Human", (x1, max(15, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # --- Serial ingestion (freshest sample only) ---
+            if not simulated:
+                sample = None
+                try:
+                    sample = read_latest_sample(arduino)
+                except (serial.SerialException, OSError) as e:
+                    drop_to_simulation(e)
+                if sample is not None:
+                    mq135, mq2 = sample
+                    last_sample_t = time.time()
+                    if calibrator is not None:
+                        calibrator.add(sample)
+                    else:
+                        z1, z2_ = baseline.z(mq135, mq2)
+                        if abs(z1) < 1.0 and abs(z2_) < 1.0:   # clean air -> follow drift
+                            baseline.track_drift(mq135, mq2)
+
+            # --- Keyboard (also handles window events) ---
+            key = cv2.waitKey(1) & 0xFF
+            if simulated:
+                if key in SIM_SCENARIOS:
+                    d135, d2 = SIM_SCENARIOS[key]
+                    mq135, mq2 = baseline.mean[0] + d135, baseline.mean[1] + d2
+                elif key == ord("r"):
+                    mq135, mq2 = (float(v) for v in baseline.mean)
+            elif key == ord("c") and calibrator is None:
+                calibrator = Calibrator(args.calib_seconds)
+                print("[CALIBRATION] Re-calibrating - keep sensors in clean air.")
+
+            if calibrator is not None and calibrator.done():
+                baseline = calibrator.result()
+                calibrator = None
+                print(f"[CALIBRATION] Done. {baseline.describe()}")
+                print(f"              Detect at z>={Z_DETECT}, critical at z>={Z_CRITICAL} "
+                      f"(i.e. MQ-135 > {baseline.mean[0] + Z_CRITICAL * baseline.scale[0]:.0f}, "
+                      f"MQ-2 > {baseline.mean[1] + Z_CRITICAL * baseline.scale[1]:.0f}).")
+
+            # --- Chemical MLP + fusion ---
+            z135, z2 = baseline.z(mq135, mq2)
+            calibrating = calibrator is not None
+            if calibrating:
+                gas_status, gas_class_id, gas_conf = (
+                    f"Calibrating... {calibrator.remaining():.0f}s", -1, 0.0)
+                gas_critical = False
+            else:
+                gas_status, gas_class_id, gas_conf = run_gas_neural_net_inference(z135, z2)
+                gas_critical = z135 > Z_CRITICAL or z2 > Z_CRITICAL
+
+            now = time.time()
+            if visual_hazard is not None or gas_critical:
+                alarm_until = now + ALARM_HOLD_S
+            command = decide_command(now < alarm_until, human_present)
+
+            if not simulated:
+                try:
+                    arduino.write(command)
+                except (serial.SerialException, OSError) as e:
+                    drop_to_simulation(e)
+
+            stale = (not simulated) and (now - last_sample_t > SENSOR_STALE_S)
+            draw_hud(frame, mq135, mq2, z135, z2, baseline, gas_status, gas_class_id,
+                     gas_conf, visual_hazard, command, simulated, stale, calibrating)
+
+            cv2.imshow("Multi-Modal Edge Hazard Fusion Dashboard", frame)
+            if key == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if arduino is not None:
+            try:
+                arduino.write(b"0")   # never leave the alarm latched on exit
+                arduino.close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()
